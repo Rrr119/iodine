@@ -15,6 +15,7 @@ import dns.rdatatype as rr
 import dns.rrset
 
 PROTOCOL_VERSION = 0x00000502
+RELIABLE_CTRL_LEN = 6
 HANDSHAKE_TYPES = [rr.NULL, rr.TXT, rr.CNAME, rr.MX]
 _B32_ENC_TRANS = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
@@ -259,6 +260,21 @@ class HandshakeTest(ServerTestCase):
         payload = struct.pack("!BH", userid << 3, cmc)
         return self.query_payload('I', payload)
 
+    def response_payload(self, resp):
+        rrset = resp.answer[0]
+        if rrset.rdtype == rr.NULL:
+            return rrset[0].data
+        if rrset.rdtype == rr.TXT:
+            txt = b"".join(rrset[0].strings)
+            if txt[:1] == b"t":
+                return b32_decode(txt[1:].decode("ascii"))
+            return txt[1:]
+        name = rrset[0].target if rrset.rdtype == rr.CNAME else rrset[0].exchange
+        raw = b"".join(name.labels[:-2])
+        if raw[:1] == b"h":
+            return b32_decode(raw[1:].decode("ascii"))
+        return raw[1:]
+
     def probe_downstream_codec(self, codec_char, cmc):
         # Variant 1 ('b' in iodine base32) = DOWNCODECCHECK1
         qname = f"Y{codec_char}b{cmc:03x}.{self.topdomain}"
@@ -313,6 +329,8 @@ class HandshakeTest(ServerTestCase):
                 f"unexpected probe result for codec '{codec_char}' on {self.rdtype.name}",
             )
 
+        self.check_reliable_option_and_ack(userid)
+
     def test_login_wrong_password(self):
         status, seed, userid = self.send_version(PROTOCOL_VERSION)
         self.assertEqual(status, b"VACK")
@@ -325,6 +343,21 @@ class HandshakeTest(ServerTestCase):
         self.assertEqual(status, b"VNAK")
         self.assertEqual(expected_ver, PROTOCOL_VERSION)
         self.assertEqual(userid, 0)
+
+    def check_reliable_option_and_ack(self, userid):
+        userchar = b32_encode(bytes([userid << 3]))[0]
+        qname = f"o{userchar}e000.{self.topdomain}"
+        resp = query_dns(self.ip, self.port, qname, self.rdtype)
+        self.assertEqual(resp.rcode(), dns.rcode.NOERROR)
+        self.assertEqual(self.response_payload(resp), b"Reliable")
+
+        ping = bytes([userid, 0, 0x12, 0x34])
+        qname = f"p.e-aaaa{b32_encode(ping)}.{self.topdomain}"
+        resp = query_dns(self.ip, self.port, qname, self.rdtype)
+        self.assertEqual(resp.rcode(), dns.rcode.NOERROR)
+        payload = self.response_payload(resp)
+        self.assertGreaterEqual(len(payload), 2 + RELIABLE_CTRL_LEN)
+        self.assertEqual(payload[2:4], b"e-")
 
 
 def build_suite(srv):

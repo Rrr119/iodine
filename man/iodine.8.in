@@ -56,8 +56,9 @@ Force maximum downstream fragment size. Not setting this will cause the
 client to automatically probe the maximum accepted downstream fragment size.
 .TP
 .B -M namelen
-Maximum length of upstream hostnames, default 255.
-Usable range ca. 100 to 255.
+Maximum length of upstream hostnames, default 254.
+Usable range ca. 100 to 254 (the absolute DNS name limit is 255 octets
+including the root label).
 Use this option to scale back upstream bandwidth in favor of downstream
 bandwidth.
 Also useful for DNS servers that perform unreliably when using full-length

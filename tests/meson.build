@@ -4,7 +4,8 @@ libcheck = dependency('check', required: false)
 if libcheck.found()
   suites = [
     'base32', 'base64', 'base64u', 'base128', 'common', 'compat', 'dns',
-    'encoding', 'fw_query', 'login', 'process', 'random', 'read', 'ui', 'user'
+    'encoding', 'fw_query', 'login', 'process', 'random', 'read', 'reliable',
+    'ui', 'user'
   ]
 
   # Silence warning from check.h
@@ -33,6 +34,14 @@ if libcheck.found()
     )
   endforeach
 endif
+
+loss_bench = executable('loss_bench',
+  sources: files('loss_bench.c'),
+  include_directories: includes,
+  link_with: libcommon,
+)
+
+test('loss_bench', loss_bench)
 
 tun_ping = executable('tun_ping',
   sources: files('tun_ping.c'),

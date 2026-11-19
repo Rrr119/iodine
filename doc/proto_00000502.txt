@@ -136,6 +136,10 @@ Server sends:
 	answered immediately.
 	i or I: Immediate (non-lazy) mode, server will answer all requests
 	(nearly) immediately.
+	e or E: Selective retransmission mode. The server replies "Reliable"
+		if accepted. This option is negotiated before the downstream
+		fragment size is set. It is backward compatible: peers that do
+		not negotiate it continue to use the legacy framing below.
 
 Probe downstream fragment size:
 Client sends:
@@ -161,6 +165,9 @@ Server sends:
 	2 bytes new downstream fragment size. After this all downstream
 	payloads will be max (fragsize + 2) bytes long.
 	BADFRAG if not accepted.
+	In selective retransmission mode the server subtracts the 6-byte ACK
+	control from the requested size, keeping the complete downstream payload
+	within the probed MTU.
 
 Data:
 Upstream data header:
@@ -187,6 +194,23 @@ UDCMC = Upstream Data CMC, 36 steps a-z0-9, case-insensitive
 Upstream data packet starts with 1 byte ASCII hex coded user byte; then 3 bytes
 Base32 encoded header; then 1 char data-CMC; then comes the payload data,
 encoded with the chosen upstream codec.
+
+When selective retransmission is enabled, a control label is inserted between
+the legacy 5-char data header and the encoded payload:
+
+	<legacy 5-char header>.<ack control><encoded payload>
+
+The ACK control is always 6 characters:
+
+	e-AAAA
+
+The leading "e-" is the control marker. The four Base32 characters encode
+four 4-bit nibbles, least significant first, of a 16-bit fragment bitmap.
+Bit N is set when fragment N of the current upstream packet was received.
+The first unset bit is retransmitted. The extra dot keeps every DNS label
+within the 63-octet limit.
+The bitmap is only applied when the upstream sequence number in the legacy
+header matches the packet currently being transmitted.
 
 Downstream data starts with 2 byte header. Then payload data, which may be
 compressed.
@@ -227,6 +251,25 @@ always starting with the 2 bytes downstream data header as shown above.
 If server has nothing to send, no data is added after the header.
 If server has something to send, it will add the downstream data packet
 (or some fragment of it) after the header.
+
+In selective retransmission mode the two-byte header is immediately followed
+by the same 6-character ACK control described above, before any downstream
+payload:
+
+	<2-byte header><e-AAAA><payload or nothing>
+
+The bitmap ACKs the current downstream packet. The server sends the lowest
+unacknowledged fragment on the next query, so a lost middle fragment does not
+force the whole packet to be discarded. Ping requests use:
+
+	P.<ack control><encoded ping data>
+
+The downstream response carries both upstream ACK and downstream data ACK, so
+each direction can make progress independently. The advertised EDNS0 payload
+is 1232 bytes and runtime fragment sizes are reduced multiplicatively after
+loss, then increased additively after a stable period.
+The downstream bitmap is only applied when the downstream sequence number in
+the client's legacy header matches the server's current output packet.
 
 
 "Lazy-mode" operation

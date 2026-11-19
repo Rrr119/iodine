@@ -168,7 +168,7 @@ main(int argc, char **argv)
 	raw_mode = 1;
 	lazymode = 1;
 	selecttimeout = 4;
-	hostname_maxlen = 0xFF;
+	hostname_maxlen = DNS_MAX_HOSTNAME_CHARS;
 	nameserv_family = AF_UNSPEC;
 
 	progname_init(argv[0]);
@@ -221,8 +221,8 @@ main(int argc, char **argv)
 			break;
 		case 'M':
 			hostname_maxlen = atoi(optarg);
-			if (hostname_maxlen > 255)
-				hostname_maxlen = 255;
+			if (hostname_maxlen > DNS_MAX_HOSTNAME_CHARS)
+				hostname_maxlen = DNS_MAX_HOSTNAME_CHARS;
 			if (hostname_maxlen < 10)
 				hostname_maxlen = 10;
 			break;

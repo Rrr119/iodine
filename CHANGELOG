@@ -6,6 +6,15 @@ iodine - https://code.kryo.se/iodine
 CHANGES:
 
 master:
+	- Added negotiated selective retransmission for DNS data packets.
+	  Fragments carry a 16-bit ACK bitmap and only missing fragments are
+	  retransmitted.
+	- Added runtime fragment-size adaptation and capped EDNS0 payloads at
+	  1232 bytes to avoid oversized replies through strict resolvers.
+	- Fixed the DNS hostname budget so the protocol header is included in
+	  the 255-octet absolute-name limit.
+	- Added a deterministic 10% packet-loss throughput benchmark
+	  (loss_bench).
 	- Added Haiku support, tested on R1/beta 6.
 	- Support for reading packet destination IP added on Windows.
 	- Downstream fragment autoprobe target size lowered from 1536

@@ -187,7 +187,8 @@ Operational info
 The DNS-response fragment size is normally autoprobed to get maximum bandwidth.
 To force a specific value (and speed things up), use the `-m` option.
 
-The DNS hostnames are normally used up to their maximum length, 255 characters.
+The DNS hostnames are normally used up to their maximum length, 254
+presentation characters (255 octets on the wire including the root label).
 Some DNS relays have been found that answer full-length queries rather
 unreliably, giving widely varying (and mostly very bad) results of the
 fragment size autoprobe on repeated tries. In these cases, use the `-M` switch
@@ -204,9 +205,11 @@ The upstream data is sent gzipped encoded with Base32; or Base64 if the relay
 server supports mixed case and `+` in domain names; or Base64u if `_` is
 supported instead; or Base128 if high-byte-value characters are supported.
 This upstream encoding is autodetected. The DNS protocol allows one query per
-packet, and one query can be max 256 chars. Each domain name part can be max
+packet, and one query can be at most 254 presentation characters (255 octets
+on the wire including the root label). Each domain name part can be at most
 63 chars. So your domain name and subdomain should be as short as possible to
-allow maximum upstream throughput.
+allow maximum upstream throughput. If the negotiated encoding starts being
+rewritten or dropped by a resolver, the client falls back to Base32.
 
 Several DNS request types are supported, with the `NULL` and `PRIVATE` types
 expected to provide the largest downstream bandwidth. The `PRIVATE` type uses
@@ -249,9 +252,32 @@ you can ignore the `SERVFAIL` errors.
 If you are running on a local network without any DNS server in-between, try
 `-I 50` (iodine and iodined close the connection after 60 seconds of silence).
 The only time you'll notice a slowdown, is when DNS reply packets go missing;
-the `iodined` server then has to wait for a new ping to re-send the data. You can
-speed this up by generating some upstream traffic (keypress, ping). If this
-happens often, check your network for bottlenecks and/or run with `-I1`.
+the `iodined` server then has to wait for a new ping to re-send the data. New
+clients negotiate selective retransmission with `iodined`: every data packet
+carries a 16-bit fragment ACK bitmap, and only missing fragments are resent.
+This keeps a 10% packet-loss path usable instead of discarding the whole IP
+packet. You can still speed things up by generating some upstream traffic
+(keypress, ping). If this happens often, check your network for bottlenecks
+and/or run with `-I1`.
+
+The EDNS0 payload is capped at 1232 bytes and downstream fragment sizes are
+adapted at runtime: repeated loss reduces the size, while a stable period
+allows it to grow again. This avoids relying on IP fragmentation through
+strict resolvers. The DNS name budget also reserves the protocol header, so a
+full-size query never exceeds the 255-octet absolute DNS name limit.
+
+#### Loss benchmark
+
+The selective-repeat implementation has a deterministic benchmark with 10%
+loss in both directions:
+
+```
+meson test -C build loss_bench
+```
+
+It reports the number of rounds, fragments sent, and achieved bytes per
+wire fragment. The test fails if throughput falls below 70% of the wire
+capacity.
 
 The delayed answering in lazy mode will cause some “carrier grade” commercial
 DNS relays to repeatedly re-send the same DNS query to the iodined server.

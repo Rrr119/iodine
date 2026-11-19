@@ -32,6 +32,27 @@ hostname_need(const char *topdomain)
 	return strlen(topdomain) + 8;
 }
 
+size_t
+hostname_payload_capacity(const char *topdomain, size_t maxlen,
+			  const struct encoder *encoder)
+{
+	size_t need;
+	size_t space;
+
+	if (!topdomain || !encoder || !encoder->blocksize_encoded)
+		return 0;
+
+	need = hostname_need(topdomain);
+	if (maxlen > DNS_MAX_HOSTNAME_CHARS)
+		maxlen = DNS_MAX_HOSTNAME_CHARS;
+	if (maxlen < need)
+		return 0;
+
+	space = maxlen - need;
+	space -= space / 57;
+	return (space * encoder->blocksize_raw) / encoder->blocksize_encoded;
+}
+
 int
 build_hostname(char *buf, size_t buflen, const char *data,
 	       const size_t datalen, const char *topdomain,
@@ -43,8 +64,13 @@ build_hostname(char *buf, size_t buflen, const char *data,
 	size_t cap;
 	size_t remain;
 
+	if (!buflen)
+		return 0;
+
 	need = hostname_need(topdomain);
-	cap = MIN((size_t)maxlen, buflen);
+	cap = MIN((size_t)maxlen, buflen - 1);
+	if (cap > DNS_MAX_HOSTNAME_CHARS)
+		cap = DNS_MAX_HOSTNAME_CHARS;
 	if (cap < need) {
 		/* The topdomain plus the fixed overhead do not fit into
 		   the maximum hostname length. Without this check the

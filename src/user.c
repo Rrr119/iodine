@@ -153,6 +153,7 @@ find_available_user(unsigned int *user)
 			users[i].authenticated = 0;
 			users[i].authenticated_raw = 0;
 			users[i].options_locked = 0;
+			users[i].reliable = 0;
 			users[i].last_pkt = time(NULL);
 			users[i].fragsize = 4096;
 			users[i].conn = CONN_DNS_NULL;

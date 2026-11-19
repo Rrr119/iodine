@@ -70,6 +70,7 @@ static struct net_addr bind_addr;
 static void write_dns(sock_t fd, struct dns_msg *q, const char *data, size_t datalen, const struct encoder *downenc);
 static void handle_full_packet(sock_t tun_fd, struct dnsfd *dns_fds, int userid);
 static int raw_decode(char *packet, int len, struct udp_addr *addr, sock_t dns_fd, struct dnsfd *dns_fds, sock_t tun_fd);
+static void send_reliable_ack(sock_t dns_fd, int userid, struct dns_msg *q);
 
 void
 server_stop(void)
@@ -136,6 +137,26 @@ start_new_outpacket(int userid, char *data, unsigned int datalen)
 	users[userid].outpacket.seqno = (users[userid].outpacket.seqno + 1) & 7;
 	users[userid].outpacket.fragment = 0;
 	users[userid].outfragresent = 0;
+	if (users[userid].reliable) {
+		unsigned int fragsize;
+
+		fragsize = reliable_mtu_value(&users[userid].down_mtu);
+		if (fragsize < 2)
+			fragsize = 2;
+		if (datalen > fragsize * RELIABLE_MAX_FRAGS) {
+			ui_debug(1, "OUT  packet to user %d no longer fits; dropping\n",
+				 userid);
+			users[userid].outpacket.len = 0;
+			users[userid].outpacket.offset = 0;
+			users[userid].outpacket.sentlen = 0;
+			users[userid].outfragresent = 0;
+			return;
+		}
+		users[userid].fragsize = fragsize;
+		reliable_tx_reset(&users[userid].outtx,
+				  users[userid].outpacket.seqno,
+				  datalen, fragsize);
+	}
 }
 
 #ifdef OUTPACKETQ_LEN
@@ -338,7 +359,10 @@ answer_from_qmem(sock_t dns_fd, struct dns_msg *q,
 		ui_debug(1, "OUT  from qmem for %s == duplicate, sending illegal reply\n",
 			 q->name);
 
-		write_dns(dns_fd, q, "x", 1, &base32_ops);
+		if (users[userid].reliable)
+			send_reliable_ack(dns_fd, userid, q);
+		else
+			write_dns(dns_fd, q, "x", 1, &base32_ops);
 
 		q->id = 0;	/* this query was used */
 		return 1;
@@ -346,6 +370,55 @@ answer_from_qmem(sock_t dns_fd, struct dns_msg *q,
 
 	/* here only when no match found */
 	return 0;
+}
+
+static void
+process_reliable_downstream_ack(int userid, uint16_t bitmap)
+{
+	int next;
+
+	if (!users[userid].reliable || users[userid].outpacket.len <= 0)
+		return;
+
+	if (reliable_tx_ack(&users[userid].outtx, bitmap))
+		reliable_mtu_success(&users[userid].down_mtu, 0);
+
+	if (reliable_tx_complete(&users[userid].outtx)) {
+		users[userid].outpacket.len = 0;
+		users[userid].outpacket.offset = 0;
+		users[userid].outpacket.sentlen = 0;
+		users[userid].outfragresent = 0;
+#ifdef OUTPACKETQ_LEN
+		get_from_outpacketq(userid);
+#endif
+		return;
+	}
+
+	next = reliable_tx_next(&users[userid].outtx);
+	if (next >= 0) {
+		users[userid].outpacket.fragment = next;
+		users[userid].outpacket.offset =
+			users[userid].outtx.offset[next];
+		users[userid].outpacket.sentlen = 0;
+		users[userid].outfragresent = 0;
+	}
+}
+
+static void
+send_reliable_ack(sock_t dns_fd, int userid, struct dns_msg *q)
+{
+	char pkt[2 + RELIABLE_CTRL_LEN];
+
+	pkt[0] = (1 << 7) |
+		((users[userid].inpacket.seqno & 7) << 4) |
+		(users[userid].inpacket.fragment & 15);
+	pkt[1] = ((users[userid].outpacket.seqno & 7) << 5) |
+		((users[userid].outpacket.fragment & 15) << 1);
+	reliable_ctl_encode(pkt + 2, reliable_rx_bitmap(&users[userid].inrx));
+
+	write_dns(dns_fd, q, pkt, sizeof(pkt),
+		  users[userid].down_encoder);
+	q->id = 0;
 }
 
 /* Sends current fragment to user, or dataless packet if there is no
@@ -362,12 +435,16 @@ send_chunk_or_dataless(struct dnsfd *dns_fds, int userid, struct dns_msg *q)
 {
 	char pkt[4096];
 	unsigned int datalen = 0;
+	unsigned int ctl = users[userid].reliable ? RELIABLE_CTRL_LEN : 0;
+	unsigned int hdrlen = 2 + ctl;
 	int last = 0;
 	sock_t dns_fd;
 
 	/* If re-sent too many times, drop entire packet */
 	if (users[userid].outpacket.len > 0 &&
 	    users[userid].outfragresent > 5) {
+		if (users[userid].reliable)
+			reliable_mtu_loss(&users[userid].down_mtu);
 		users[userid].outpacket.len = 0;
 		users[userid].outpacket.offset = 0;
 		users[userid].outpacket.sentlen = 0;
@@ -379,15 +456,61 @@ send_chunk_or_dataless(struct dnsfd *dns_fds, int userid, struct dns_msg *q)
 #endif
 	}
 
+	if (users[userid].reliable &&
+	    users[userid].outpacket.len >
+	    (unsigned int) users[userid].fragsize * RELIABLE_MAX_FRAGS) {
+		ui_debug(1, "OUT  packet to user %d needs too many fragments; dropping\n",
+			 userid);
+		reliable_mtu_loss(&users[userid].down_mtu);
+		users[userid].outpacket.len = 0;
+		users[userid].outpacket.offset = 0;
+		users[userid].outpacket.sentlen = 0;
+		users[userid].outfragresent = 0;
+#ifdef OUTPACKETQ_LEN
+		get_from_outpacketq(userid);
+#endif
+	}
+
 	if (users[userid].outpacket.len > 0) {
-		datalen = MIN(users[userid].fragsize, users[userid].outpacket.len - users[userid].outpacket.offset);
-		datalen = MIN(datalen, sizeof(pkt)-2);
+		if (users[userid].reliable) {
+			int fragment = reliable_tx_next(&users[userid].outtx);
 
-		memcpy(&pkt[2], users[userid].outpacket.data + users[userid].outpacket.offset, datalen);
+			if (fragment < 0) {
+				users[userid].outpacket.len = 0;
+				users[userid].outpacket.offset = 0;
+				users[userid].outpacket.sentlen = 0;
+#ifdef OUTPACKETQ_LEN
+				get_from_outpacketq(userid);
+#endif
+			} else {
+				users[userid].outpacket.fragment = fragment;
+				users[userid].outpacket.offset =
+					users[userid].outtx.offset[fragment];
+				datalen = users[userid].outtx.length[fragment];
+				last = fragment ==
+					users[userid].outtx.count - 1;
+			}
+		} else {
+			datalen = MIN(users[userid].fragsize,
+				      users[userid].outpacket.len -
+				      users[userid].outpacket.offset);
+			last = (users[userid].outpacket.len ==
+				users[userid].outpacket.offset + datalen);
+		}
+
+		if (datalen) {
+			datalen = MIN(datalen, sizeof(pkt) - hdrlen);
+			memcpy(&pkt[hdrlen],
+			       users[userid].outpacket.data +
+			       users[userid].outpacket.offset, datalen);
+		}
 		users[userid].outpacket.sentlen = datalen;
-		last = (users[userid].outpacket.len == users[userid].outpacket.offset + datalen);
 
-		users[userid].outfragresent++;
+		if (datalen)
+			users[userid].outfragresent++;
+		if (users[userid].reliable &&
+		    users[userid].outfragresent == 3)
+			reliable_mtu_loss(&users[userid].down_mtu);
 	}
 
 	/* Build downstream data header (see doc/proto_xxxxxxxx.txt) */
@@ -398,30 +521,36 @@ send_chunk_or_dataless(struct dnsfd *dns_fds, int userid, struct dns_msg *q)
 	/* Second byte is 3 bits downstream seqno, 4 bits downstream fragment, 1 bit last flag */
 	pkt[1] = ((users[userid].outpacket.seqno & 7) << 5) |
 		((users[userid].outpacket.fragment & 15) << 1) | (last & 1);
+	if (ctl)
+		reliable_ctl_encode(pkt + 2,
+				    reliable_rx_bitmap(&users[userid].inrx));
 
 	ui_debug(1, "OUT  pkt seq# %d, frag %d (last=%d), offset %d, fragsize %u, total %d, to user %d\n",
 		 users[userid].outpacket.seqno & 7, users[userid].outpacket.fragment & 15,
 		 last, users[userid].outpacket.offset, datalen, users[userid].outpacket.len, userid);
 	dns_fd = get_dns_fd(dns_fds, &q->address);
-	write_dns(dns_fd, q, pkt, datalen + 2, users[userid].down_encoder);
+	write_dns(dns_fd, q, pkt, datalen + hdrlen,
+		  users[userid].down_encoder);
 
 	if (q->id2 != 0) {
 		q->id = q->id2;
 		q->address = q->address2;
 		ui_debug(1, "OUT  again to last duplicate\n");
 		dns_fd = get_dns_fd(dns_fds, &q->address);
-		write_dns(dns_fd, q, pkt, datalen + 2, users[userid].down_encoder);
+		write_dns(dns_fd, q, pkt, datalen + hdrlen,
+			  users[userid].down_encoder);
 	}
 
 	save_to_qmem_pingordata(userid, q);
 
 #ifdef DNSCACHE_LEN
-	save_to_dnscache(userid, q, pkt, datalen + 2);
+	save_to_dnscache(userid, q, pkt, datalen + hdrlen);
 #endif
 
 	q->id = 0;			/* this query is used */
 
-	if (datalen > 0 && datalen == users[userid].outpacket.len) {
+	if (!users[userid].reliable && datalen > 0 &&
+	    datalen == users[userid].outpacket.len) {
 		/* Whole packet was sent in one chunk, dont wait for ack */
 		users[userid].outpacket.len = 0;
 		users[userid].outpacket.offset = 0;
@@ -463,6 +592,14 @@ tunnel_tun(sock_t tun_fd, struct dnsfd *dns_fds)
 	compress2((uint8_t*)out, &outlen, (uint8_t*)in, read, 9);
 
 	if (users[userid].conn == CONN_DNS_NULL) {
+		if (users[userid].reliable &&
+		    outlen > (unsigned long) reliable_mtu_value(
+			    &users[userid].down_mtu) * RELIABLE_MAX_FRAGS) {
+			reliable_mtu_loss(&users[userid].down_mtu);
+			ui_debug(1, "OUT  packet to user %d needs too many fragments; dropping\n",
+				 userid);
+			return 0;
+		}
 #ifdef OUTPACKETQ_LEN
 		/* If a packet is being sent, try storing the new one in the queue.
 		   If the queue is full, drop the packet. TCP will hopefully notice
@@ -580,6 +717,10 @@ handle_version_request(sock_t dns_fd, char *in, int domain_len, struct dns_msg *
 	users[userid].inpacket.seqno = 0;
 	users[userid].inpacket.fragment = 0;
 	users[userid].fragsize = 100; /* very safe */
+	users[userid].reliable = 0;
+	reliable_rx_reset(&users[userid].inrx, 0);
+	memset(&users[userid].outtx, 0, sizeof(users[userid].outtx));
+	reliable_mtu_init(&users[userid].down_mtu, 100, 64, 100);
 	users[userid].conn = CONN_DNS_NULL;
 	users[userid].lazy = 0;
 #ifdef OUTPACKETQ_LEN
@@ -602,6 +743,9 @@ handle_version_request(sock_t dns_fd, char *in, int domain_len, struct dns_msg *
 static void
 process_downstream_ack(int userid, int down_seq, int down_frag)
 {
+	if (users[userid].reliable)
+		return;
+
 	if (users[userid].outpacket.len <= 0)
 		/* No packet to apply acks to */
 		return;
@@ -744,7 +888,7 @@ handle_upstream_codec_switch_request(sock_t dns_fd, char *in, int domain_len, st
 	}
 
 	userid = b32_8to5(in[1]);
-	if (check_authenticated_user_and_ip_and_options(userid, check_ip, &q->address) != 0) {
+	if (check_authenticated_user_and_ip(userid, check_ip, &q->address) != 0) {
 		write_dns(dns_fd, q, "BADIP", 5, &base32_ops);
 		return; /* illegal id */
 	}
@@ -797,6 +941,21 @@ handle_options_request(sock_t dns_fd, char *in, int domain_len, struct dns_msg *
 	}
 	/* Other options */
 	switch (ascii_tolower(in[2])) {
+	case 'e': {
+		unsigned int floor;
+
+		users[userid].reliable = 1;
+		reliable_rx_reset(&users[userid].inrx, 0);
+		memset(&users[userid].outtx, 0,
+		       sizeof(users[userid].outtx));
+		floor = MIN(users[userid].fragsize, 64);
+		reliable_mtu_init(&users[userid].down_mtu,
+				  users[userid].fragsize,
+				  floor, users[userid].fragsize);
+		write_dns(dns_fd, q, "Reliable", 8,
+			  users[userid].down_encoder);
+		break;
+	}
 	case 'l':
 		users[userid].lazy = 1;
 		write_dns(dns_fd, q, "Lazy", 4, users[userid].down_encoder);
@@ -869,6 +1028,8 @@ handle_downstream_fragsize_probe_request(sock_t dns_fd, char *in, int domain_len
 		char buf[2048];
 		int i;
 		unsigned int v;
+
+		req_frag_size = MIN(req_frag_size, DNS_EDNS0_PAYLOAD);
 		secure_random(&v, sizeof(v));
 		v &= 0xff;
 
@@ -908,7 +1069,23 @@ handle_downstream_fragsize_set_request(sock_t dns_fd, char *in, int domain_len, 
 	if (max_frag_size < 2) {
 		write_dns(dns_fd, q, "BADFRAG", 7, users[userid].down_encoder);
 	} else {
-		users[userid].fragsize = max_frag_size;
+		unsigned int data_frag_size;
+
+		max_frag_size = MIN(max_frag_size, DNS_EDNS0_PAYLOAD);
+		data_frag_size = max_frag_size;
+		if (users[userid].reliable &&
+		    data_frag_size > 2 + RELIABLE_CTRL_LEN)
+			data_frag_size -= 2 + RELIABLE_CTRL_LEN;
+		users[userid].fragsize = data_frag_size;
+		if (users[userid].reliable) {
+			unsigned int floor = MIN(data_frag_size, 64);
+
+			reliable_mtu_init(&users[userid].down_mtu,
+					  data_frag_size, floor,
+					  data_frag_size);
+		}
+		unpacked[1] = (data_frag_size >> 8) & 0xff;
+		unpacked[2] = data_frag_size & 0xff;
 		users[userid].options_locked = 1;
 		write_dns(dns_fd, q, &unpacked[1], 2, users[userid].down_encoder);
 	}
@@ -1001,6 +1178,17 @@ handle_null_request(sock_t tun_fd, sock_t dns_fd, struct dnsfd *dns_fds, struct 
 		int dn_seq;
 		int dn_frag;
 		int didsend = 0;
+		int dataoff = 1;
+		uint16_t ack_bitmap = 0;
+		int have_ack = 0;
+
+		if (domain_len >= 2 + RELIABLE_CTRL_LEN &&
+		    in[1] == '.' &&
+		    reliable_ctl_decode(&in[2], domain_len - 2,
+					&ack_bitmap)) {
+			have_ack = 1;
+			dataoff = 2 + RELIABLE_CTRL_LEN;
+		}
 
 		/* We can't handle id=0, that's "no packet" to us. So drop
 		   request completely. Note that DNS servers rewrite the id.
@@ -1011,22 +1199,29 @@ handle_null_request(sock_t tun_fd, sock_t dns_fd, struct dnsfd *dns_fds, struct 
 		if (q->id == 0)
 			return;
 
-		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, &base32_ops);
+		read = unpack_data(unpacked, sizeof(unpacked), &(in[dataoff]),
+				   domain_len - dataoff, &base32_ops);
 		if (read < 4)
 			return;
 
 		/* Ping packet, store userid */
 		userid = unpacked[0];
 		if (check_authenticated_user_and_ip(userid, check_ip, &q->address) != 0) {
+			ui_debug(1, "PING rejected user %u from %s\n", userid,
+				 format_addr(&q->address.remote));
 			write_dns(dns_fd, q, "BADIP", 5, &base32_ops);
 			return; /* illegal id */
 		}
-
-		if (check_duplicate_query(dns_fd, userid, q, QMEM_PING, unpacked, "PING"))
+		if (users[userid].reliable && !have_ack)
 			return;
 
 		dn_seq = unpacked[1] >> 4;
 		dn_frag = unpacked[1] & 15;
+		if (have_ack && dn_seq == (users[userid].outpacket.seqno & 7))
+			process_reliable_downstream_ack(userid, ack_bitmap);
+
+		if (check_duplicate_query(dns_fd, userid, q, QMEM_PING, unpacked, "PING"))
+			return;
 
 		ui_debug(1, "PING pkt from user %d, ack for downstream %d/%d\n",
 			 userid, dn_seq, dn_frag);
@@ -1073,6 +1268,9 @@ handle_null_request(sock_t tun_fd, sock_t dns_fd, struct dnsfd *dns_fds, struct 
 		int upstream_ok = 1;
 		int didsend = 0;
 		int code = -1;
+		int dataoff = 5;
+		uint16_t ack_bitmap = 0;
+		int have_ack = 0;
 
 		/* Need 5char header + >=1 char data */
 		if (domain_len < 6)
@@ -1099,12 +1297,15 @@ handle_null_request(sock_t tun_fd, sock_t dns_fd, struct dnsfd *dns_fds, struct 
 			return; /* illegal id */
 		}
 
-		for (int i = 0; i < 4; i++)
-			cmc[i] = ascii_tolower(q->name[i+1]);
-
-		if (check_duplicate_query(dns_fd, userid, q, QMEM_DATA, cmc, "IN"))
-			return;
-
+		if (users[userid].reliable) {
+			if (domain_len < 7 + RELIABLE_CTRL_LEN ||
+			    in[5] != '.' ||
+			    !reliable_ctl_decode(&in[6], domain_len - 6,
+						 &ack_bitmap))
+				return;
+			have_ack = 1;
+			dataoff = 6 + RELIABLE_CTRL_LEN;
+		}
 		/* Decode data header */
 		up_seq = (b32_8to5(in[1]) >> 2) & 7;
 		up_frag = ((b32_8to5(in[1]) & 3) << 2) | ((b32_8to5(in[2]) >> 3) & 3);
@@ -1112,9 +1313,33 @@ handle_null_request(sock_t tun_fd, sock_t dns_fd, struct dnsfd *dns_fds, struct 
 		dn_frag = b32_8to5(in[3]) >> 1;
 		lastfrag = b32_8to5(in[3]) & 1;
 
+		if (have_ack && dn_seq == (users[userid].outpacket.seqno & 7))
+			process_reliable_downstream_ack(userid, ack_bitmap);
+
+		for (int i = 0; i < 4; i++)
+			cmc[i] = ascii_tolower(q->name[i+1]);
+
+		if (check_duplicate_query(dns_fd, userid, q, QMEM_DATA, cmc, "IN"))
+			return;
+
 		process_downstream_ack(userid, dn_seq, dn_frag);
 
-		if (up_seq == users[userid].inpacket.seqno &&
+		if (users[userid].reliable) {
+			if (up_seq != users[userid].inrx.seq &&
+			    recent_seqno(users[userid].inrx.seq, up_seq)) {
+				ui_debug(1, "IN   old upstream packet seq# %d, frag %d\n",
+					 up_seq, up_frag);
+				upstream_ok = 0;
+			} else {
+				if (up_seq != users[userid].inrx.seq) {
+					users[userid].inpacket.seqno = up_seq;
+					users[userid].inpacket.len = 0;
+					users[userid].inpacket.offset = 0;
+				}
+				users[userid].inpacket.seqno = up_seq;
+				users[userid].inpacket.fragment = up_frag;
+			}
+		} else if (up_seq == users[userid].inpacket.seqno &&
 			up_frag <= users[userid].inpacket.fragment) {
 			/* Got repeated old packet _with data_, probably
 			   because client didn't receive our ack. So re-send
@@ -1154,21 +1379,56 @@ handle_null_request(sock_t tun_fd, sock_t dns_fd, struct dnsfd *dns_fds, struct 
 
 		if (upstream_ok) {
 			/* decode with this user's encoding */
-			read = unpack_data(unpacked, sizeof(unpacked), &(in[5]), domain_len - 5,
+			read = unpack_data(unpacked, sizeof(unpacked),
+					   &(in[dataoff]),
+					   domain_len - dataoff,
 					   users[userid].up_encoder);
 
-			/* copy to packet buffer, update length */
-			read = MIN((unsigned int)read, sizeof(users[userid].inpacket.data) - users[userid].inpacket.offset);
-			memcpy(users[userid].inpacket.data + users[userid].inpacket.offset, unpacked, read);
-			users[userid].inpacket.len += read;
-			users[userid].inpacket.offset += read;
+			if (users[userid].reliable) {
+				if (!reliable_rx_put(
+					    &users[userid].inrx, up_seq,
+					    up_frag, lastfrag, read,
+					    sizeof(users[userid].inpacket.data) /
+					    RELIABLE_MAX_FRAGS,
+					    unpacked,
+					    users[userid].inpacket.data)) {
+					upstream_ok = 0;
+				}
+			} else {
+				/* copy to packet buffer, update length */
+				read = MIN((unsigned int)read,
+					   sizeof(users[userid].inpacket.data) -
+					   users[userid].inpacket.offset);
+				memcpy(users[userid].inpacket.data +
+				       users[userid].inpacket.offset,
+				       unpacked, read);
+				users[userid].inpacket.len += read;
+				users[userid].inpacket.offset += read;
+			}
 
 			ui_debug(1, "IN   pkt seq# %d, frag %d (last=%d), fragsize %d, total %d, from user %d\n",
 				 up_seq, up_frag, lastfrag, read, users[userid].inpacket.len, userid);
 		}
 
-		if (upstream_ok && lastfrag) { /* packet is complete */
-			handle_full_packet(tun_fd, dns_fds, userid);
+		if (upstream_ok) {
+			if (users[userid].reliable &&
+			    reliable_rx_complete(&users[userid].inrx)) {
+				size_t assembled = reliable_rx_assemble(
+					&users[userid].inrx,
+					users[userid].inpacket.data,
+					sizeof(users[userid].inpacket.data) /
+					RELIABLE_MAX_FRAGS,
+					sizeof(users[userid].inpacket.data));
+
+				if (assembled) {
+					users[userid].inpacket.len =
+						(unsigned int) assembled;
+					handle_full_packet(tun_fd, dns_fds,
+							   userid);
+				}
+			} else if (!users[userid].reliable && lastfrag) {
+				handle_full_packet(tun_fd, dns_fds, userid);
+			}
 		}
 
 		/* If there is a query that must be returned real soon, do it.

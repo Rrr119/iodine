@@ -34,6 +34,7 @@ typedef enum {
 } qr_t;
 
 #define DNS_PORT 53
+#define DNS_EDNS0_PAYLOAD 1232
 
 #define DNS_MSG_NAME_SIZE 256
 

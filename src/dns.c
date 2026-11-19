@@ -201,7 +201,7 @@ dns_encode(char *buf, size_t buflen, struct dns_msg *q, qr_t qr,
 			CHECKLEN(11);
 			putbyte(&p, 0x00);    /* Root */
 			putshort(&p, 0x0029); /* OPT */
-			putshort(&p, 0x1000); /* Payload size: 4096 */
+			putshort(&p, DNS_EDNS0_PAYLOAD); /* IPv6-safe MTU */
 			putshort(&p, 0x0000); /* Higher bits/edns version */
 			putshort(&p, 0x8000); /* Z */
 			putshort(&p, 0x0000); /* Data length */

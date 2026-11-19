@@ -38,6 +38,10 @@
 	"\141\251\161\040\045\263\006\163\346\330\104\060\171\120\127\277"
 #define DOWNCODECCHECK1_LEN  48
 
+/* Maximum presentation-format DNS name.  The terminating root label adds
+ * one octet on the wire, making the absolute DNS name limit of 255 octets. */
+#define DNS_MAX_HOSTNAME_CHARS 254
+
 struct encoder {
 	/* This name is sent as reply when switching codec */
 	const char name[8];
@@ -56,6 +60,8 @@ struct encoder {
 };
 
 size_t hostname_need(const char *);
+size_t hostname_payload_capacity(const char *topdomain, size_t maxlen,
+				 const struct encoder *encoder);
 int build_hostname(char *, size_t, const char *, const size_t, const char *,
 		   const struct encoder *, int);
 int unpack_data(char *, size_t, char *, size_t, const struct encoder *);

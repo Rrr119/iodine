@@ -25,6 +25,7 @@
 #include "src/compat.h"
 #include "src/dns.h"
 #include "src/encoding.h"
+#include "src/reliable.h"
 #include "test_main.h"
 
 #define TUPLES 4
@@ -106,6 +107,95 @@ START_TEST(test_unpack_data_bounds)
 	ck_assert_int_eq(len, sizeof(buf) - 1);
 	ck_assert_int_eq(buf[sizeof(buf) - 1], '\0');
 	ck_assert_int_eq(unpack_data(buf, 0, data, strlen(data), &base32_ops), 0);
+}
+END_TEST
+
+START_TEST(test_hostname_wire_limit)
+{
+	char data[1024];
+	char buf[4096];
+	unsigned int i;
+	size_t label = 0;
+	size_t labels = 0;
+
+	for (i = 0; i < sizeof(data); i++)
+		data[i] = (char) (i * 29 + 3);
+
+	build_hostname(buf, sizeof(buf), data, sizeof(data), "a.c",
+		       &base32_ops, DNS_MAX_HOSTNAME_CHARS);
+
+	ck_assert_uint_le(strlen(buf), DNS_MAX_HOSTNAME_CHARS);
+	for (i = 0; buf[i]; i++) {
+		if (buf[i] == '.') {
+			ck_assert_uint_le(label, 63);
+			label = 0;
+			labels++;
+		} else {
+			label++;
+		}
+	}
+	ck_assert_uint_le(label, 63);
+	ck_assert_uint_gt(labels, 0);
+}
+END_TEST
+
+START_TEST(test_hostname_payload_capacity)
+{
+	static const struct encoder *const encs[] = {
+		&base32_ops, &base64_ops, &base64u_ops, &base128_ops, NULL
+	};
+	char data[1024];
+	char buf[4096];
+	size_t i;
+
+	for (i = 0; i < sizeof(data); i++)
+		data[i] = (char) (i * 41 + 7);
+
+	for (i = 0; encs[i] != NULL; i++) {
+		size_t capacity = hostname_payload_capacity(
+			"a.c", DNS_MAX_HOSTNAME_CHARS, encs[i]);
+		int used = build_hostname(
+			buf, sizeof(buf), data, sizeof(data), "a.c",
+			encs[i], DNS_MAX_HOSTNAME_CHARS);
+
+		ck_assert_uint_gt(capacity, 0);
+		ck_assert_uint_eq(capacity, used);
+		ck_assert_uint_le(strlen(buf), DNS_MAX_HOSTNAME_CHARS);
+	}
+}
+END_TEST
+
+START_TEST(test_reliable_hostname_layout)
+{
+	char data[1024];
+	char qname[1024];
+	char ctl[RELIABLE_CTRL_LEN];
+	size_t label = 0;
+	size_t i;
+
+	for (i = 0; i < sizeof(data); i++)
+		data[i] = (char) (i * 19 + 5);
+
+	qname[0] = '0';
+	memcpy(qname + 1, "abcd", 4);
+	qname[5] = '.';
+	reliable_ctl_encode(ctl, 0xffff);
+	memcpy(qname + 6, ctl, RELIABLE_CTRL_LEN);
+	build_hostname(qname + 12, sizeof(qname) - 12, data, sizeof(data),
+		       "a.c", &base32_ops,
+		       DNS_MAX_HOSTNAME_CHARS - 12);
+
+	ck_assert_uint_le(strlen(qname), DNS_MAX_HOSTNAME_CHARS);
+	for (i = 0; qname[i]; i++) {
+		if (qname[i] == '.') {
+			ck_assert_uint_le(label, 63);
+			ck_assert_uint_gt(label, 0);
+			label = 0;
+		} else {
+			label++;
+		}
+	}
+	ck_assert_uint_le(label, 63);
 }
 END_TEST
 
@@ -261,6 +351,9 @@ test_create(void)
 	tcase_add_loop_test(tc, test_inline_undotify, 0, TUPLES);
 	tcase_add_test(tc, test_build_hostname);
 	tcase_add_test(tc, test_unpack_data_bounds);
+	tcase_add_test(tc, test_hostname_wire_limit);
+	tcase_add_test(tc, test_hostname_payload_capacity);
+	tcase_add_test(tc, test_reliable_hostname_layout);
 	tcase_add_test(tc, test_get_encoder_by_name);
 	tcase_add_loop_test(tc, test_payload_wrap_unwrap, 0, NUM_WRAP_QTYPES);
 	tcase_add_test(tc, test_payload_wrap_raw_fallback);

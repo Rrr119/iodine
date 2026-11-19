@@ -23,6 +23,7 @@
 
 #include "common.h"
 #include "dns.h"
+#include "reliable.h"
 
 struct encoder;
 
@@ -75,6 +76,7 @@ struct tun_user {
 	int authenticated;
 	int authenticated_raw;
 	int options_locked;
+	int reliable;
 	int disabled;
 	time_t last_pkt;
 	int seed;
@@ -86,6 +88,9 @@ struct tun_user {
 	int q_sendrealsoon_new;
 	struct packet inpacket;
 	struct packet outpacket;
+	struct reliable_rx inrx;
+	struct reliable_tx outtx;
+	struct reliable_mtu down_mtu;
 	int outfragresent;
 	const struct encoder *up_encoder;
 	const struct encoder *down_encoder;

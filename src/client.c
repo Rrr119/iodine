@@ -35,6 +35,7 @@
 #include "dns.h"
 #include "login.h"
 #include "random.h"
+#include "reliable.h"
 #include "sock.h"
 #include "tun.h"
 #include "version.h"
@@ -43,6 +44,7 @@
 #include "ui.h"
 
 static void handshake_lazyoff(sock_t dns_fd);
+static void handshake_switch_codec(sock_t dns_fd, int bits);
 
 static int running;
 static const char *password;
@@ -74,6 +76,13 @@ static const struct encoder *dataenc = &base32_ops;
 /* The encoder to use for downstream data */
 static const struct encoder *downenc = NULL;
 
+/* Optional selective-repeat mode, negotiated with the server. */
+static int reliable_mode;
+static struct reliable_rx inrx;
+static struct reliable_tx outtx;
+static struct reliable_mtu up_mtu;
+static unsigned int outtx_hostname_max = DNS_MAX_HOSTNAME_CHARS;
+
 /* set query type to send */
 static unsigned short do_qtype = T_UNSET;
 
@@ -86,7 +95,7 @@ static long send_ping_soon;
 static time_t lastdownstreamtime;
 static long send_query_sendcnt = -1;
 static long send_query_recvcnt = 0;
-static int hostname_maxlen = 0xFF;
+static int hostname_maxlen = DNS_MAX_HOSTNAME_CHARS;
 
 void
 client_init(void)
@@ -107,6 +116,11 @@ client_init(void)
 	inpkt.len = 0;
 	inpkt.seqno = 0;
 	inpkt.fragment = 0;
+	reliable_mode = 0;
+	reliable_rx_reset(&inrx, 0);
+	memset(&outtx, 0, sizeof(outtx));
+	reliable_mtu_init(&up_mtu, 100, 64, DNS_MAX_HOSTNAME_CHARS);
+	outtx_hostname_max = DNS_MAX_HOSTNAME_CHARS;
 }
 
 void
@@ -204,8 +218,19 @@ client_set_lazymode(int lazy_mode)
 void
 client_set_hostname_maxlen(int i)
 {
-	if (i <= 0xFF)
+	size_t floor = 64;
+
+	if (i > DNS_MAX_HOSTNAME_CHARS)
+		i = DNS_MAX_HOSTNAME_CHARS;
+	if (i > 0)
 		hostname_maxlen = i;
+	if (topdomain) {
+		floor = hostname_need(topdomain) + 16;
+		if (floor > (size_t) hostname_maxlen)
+			floor = hostname_maxlen;
+	}
+	reliable_mtu_init(&up_mtu, hostname_maxlen,
+			  (unsigned int) floor, hostname_maxlen);
 }
 
 const char *
@@ -313,7 +338,7 @@ send_packet(sock_t fd, char cmd, const char *data, const size_t datalen)
 	buf[0] = cmd;
 
 	build_hostname(buf + 1, sizeof(buf) - 1, data, datalen, topdomain,
-		       &base32_ops, hostname_maxlen);
+		       &base32_ops, hostname_maxlen - 1);
 	send_query(fd, buf);
 }
 
@@ -329,17 +354,34 @@ send_chunk(sock_t fd)
 	char buf[4096];
 	unsigned int avail;
 	unsigned int code;
+	unsigned int prefix = reliable_mode ? 12 : 5;
+	unsigned int hostname_limit = outtx_hostname_max;
+	int fragment;
 	char *p;
 	static int datacmc = 0;
 	char *datacmcchars = "abcdefghijklmnopqrstuvwxyz0123456789";
 
-	p = outpkt.data;
-	p += outpkt.offset;
-	avail = outpkt.len - outpkt.offset;
+	if (reliable_mode) {
+		fragment = reliable_tx_next(&outtx);
+		if (fragment < 0)
+			return;
+		outpkt.fragment = fragment;
+		outpkt.offset = outtx.offset[fragment];
+		avail = outtx.length[fragment];
+	} else {
+		fragment = outpkt.fragment;
+		avail = outpkt.len - outpkt.offset;
+	}
+
+	p = outpkt.data + outpkt.offset;
+
+	if (hostname_limit <= prefix)
+		return;
 
 	/* Note: must be same, or smaller than send_fragsize_probe() */
-	outpkt.sentlen = build_hostname(buf + 5, sizeof(buf) - 5, p, avail,
-					topdomain, dataenc, hostname_maxlen);
+	outpkt.sentlen = build_hostname(buf + prefix, sizeof(buf) - prefix,
+					p, avail, topdomain, dataenc,
+					hostname_limit - prefix);
 
 	/* Build upstream data header (see doc/proto_xxxxxxxx.txt) */
 
@@ -351,13 +393,22 @@ send_chunk(sock_t fd)
 	code = ((outpkt.fragment & 3) << 3) | (inpkt.seqno & 7);
 	buf[2] = b32_5to8(code); /* Third byte is 2 bits lower fragment count, 3 bits downstream packet seqno */
 
-	code = ((inpkt.fragment & 15) << 1) | (outpkt.sentlen == avail);
+	code = ((inpkt.fragment & 15) << 1) |
+		(reliable_mode ? fragment == outtx.count - 1
+			       : outpkt.sentlen == avail);
 	buf[3] = b32_5to8(code); /* Fourth byte is 4 bits downstream fragment count, 1 bit last frag flag */
 
 	buf[4] = datacmcchars[datacmc];	/* Fifth byte is data-CMC */
 	datacmc++;
 	if (datacmc >= 36)
 		datacmc = 0;
+
+	if (reliable_mode) {
+		/* Keep the header and the control bitmap in separate labels so
+		 * that the first DNS label never exceeds 63 octets. */
+		buf[5] = '.';
+		reliable_ctl_encode(buf + 6, reliable_rx_bitmap(&inrx));
+	}
 
 #if 0
 	ui_log("  Send: down %d/%d up %d/%d, %d bytes\n",
@@ -373,6 +424,9 @@ send_ping(sock_t fd)
 {
 	if (conn == CONN_DNS_NULL) {
 		char data[4];
+		char buf[4096];
+		unsigned int prefix = reliable_mode ? 8 : 1;
+		unsigned int hostname_limit = reliable_mtu_value(&up_mtu);
 
 		data[0] = userid;
 		data[1] = ((inpkt.seqno & 7) << 4) | (inpkt.fragment & 15);
@@ -386,7 +440,18 @@ send_ping(sock_t fd)
 			inpkt.seqno, inpkt.fragment);
 #endif
 
-		send_packet(fd, 'p', data, sizeof(data));
+		buf[0] = 'p';
+		if (reliable_mode) {
+			buf[1] = '.';
+			reliable_ctl_encode(buf + 2,
+					    reliable_rx_bitmap(&inrx));
+		}
+		if (hostname_limit <= prefix)
+			return;
+		build_hostname(buf + prefix, sizeof(buf) - prefix,
+			       data, sizeof(data), topdomain, &base32_ops,
+			       hostname_limit - prefix);
+		send_query(fd, buf);
 	} else {
 		send_raw(fd, NULL, 0, RAW_HDR_CMD_PING);
 	}
@@ -597,15 +662,45 @@ tunnel_tun(sock_t tun_fd, sock_t dns_fd)
 	inlen = read;
 	compress2((uint8_t*)out, &outlen, (uint8_t*)in, inlen, 9);
 
+	if (outlen > 0xffff || outlen > sizeof(outpkt.data)) {
+		warnx("Compressed packet is too large for the DNS transport");
+		return read;
+	}
+
 	memcpy(outpkt.data, out, MIN(outlen, sizeof(outpkt.data)));
 	outpkt.sentlen = 0;
 	outpkt.offset = 0;
 	outpkt.seqno = (outpkt.seqno + 1) & 7;
-	outpkt.len = outlen;
+	outpkt.len = (unsigned int) outlen;
 	outpkt.fragment = 0;
 	outchunkresent = 0;
 
 	if (conn == CONN_DNS_NULL) {
+		outtx_hostname_max = reliable_mtu_value(&up_mtu);
+		if (reliable_mode) {
+			unsigned int prefix = 12;
+			size_t capacity = hostname_payload_capacity(
+				topdomain,
+				outtx_hostname_max - prefix,
+				dataenc);
+
+			if (!capacity ||
+			    outlen > capacity * RELIABLE_MAX_FRAGS) {
+				static int warned;
+
+				if (!warned) {
+					warnx("Packet needs more than %d DNS fragments; "
+					      "dropping it and reducing the MTU",
+					      RELIABLE_MAX_FRAGS);
+					warned = 1;
+				}
+				outpkt.len = 0;
+				reliable_mtu_loss(&up_mtu);
+				return read;
+			}
+			reliable_tx_reset(&outtx, outpkt.seqno,
+					  outlen, capacity);
+		}
 		send_chunk(dns_fd);
 
 		send_ping_soon = 0;
@@ -626,6 +721,9 @@ tunnel_dns(sock_t tun_fd, sock_t dns_fd)
 	int up_ack_fragment;
 	int new_down_seqno;
 	int new_down_fragment;
+	int payload_offset = 2;
+	int have_ack_bitmap = 0;
+	uint16_t ack_bitmap = 0;
 	struct dns_msg q;
 	unsigned long datalen;
 	char buf[64*1024];
@@ -707,6 +805,12 @@ tunnel_dns(sock_t tun_fd, sock_t dns_fd)
 	up_ack_seqno = (buf[0] >> 4) & 7;
 	up_ack_fragment = buf[0] & 15;
 
+	if (reliable_mode && read >= 2 + RELIABLE_CTRL_LEN &&
+	    reliable_ctl_decode(buf + 2, read - 2, &ack_bitmap)) {
+		have_ack_bitmap = 1;
+		payload_offset += RELIABLE_CTRL_LEN;
+	}
+
 #if 0
 	ui_log("				Recv: id %5d down %d/%d up %d/%d, %d bytes\n",
 		q.id, new_down_seqno, new_down_fragment, up_ack_seqno,
@@ -715,7 +819,7 @@ tunnel_dns(sock_t tun_fd, sock_t dns_fd)
 
 	/* Downstream data traffic */
 
-	if (read > 2 && new_down_seqno != inpkt.seqno &&
+	if (!reliable_mode && read > 2 && new_down_seqno != inpkt.seqno &&
 	    recent_seqno(inpkt.seqno, new_down_seqno)) {
 		/* This is the previous seqno, or a bit earlier.
 		   Probably out-of-sequence dupe due to unreliable
@@ -778,6 +882,60 @@ tunnel_dns(sock_t tun_fd, sock_t dns_fd)
 			send_ping_soon = 900;
 	}
 
+	if (reliable_mode) {
+		if (read > payload_offset) {
+			if (new_down_seqno != inrx.seq &&
+			    recent_seqno(inrx.seq, new_down_seqno)) {
+				/* Delayed duplicate from an older packet. */
+				send_ping_soon = 500;
+			} else if (reliable_rx_put(&inrx, new_down_seqno,
+						   new_down_fragment,
+						   buf[1] & 1,
+						   read - payload_offset,
+						   sizeof(inpkt.data) /
+						   RELIABLE_MAX_FRAGS,
+						   buf + payload_offset,
+						   inpkt.data)) {
+				inpkt.seqno = new_down_seqno;
+				inpkt.fragment = new_down_fragment;
+				inpkt.len = 0;
+
+				if (reliable_rx_complete(&inrx)) {
+					size_t assembled = reliable_rx_assemble(
+						&inrx, inpkt.data,
+						sizeof(inpkt.data) /
+						RELIABLE_MAX_FRAGS,
+						sizeof(inpkt.data));
+
+					if (assembled) {
+						datalen = sizeof(buf);
+						if (uncompress(
+							(uint8_t *) buf,
+							&datalen,
+							(uint8_t *) inpkt.data,
+							assembled) == Z_OK) {
+							write_tun(tun_fd, buf,
+								  datalen);
+						}
+					}
+					send_ping_soon = 5;
+				} else {
+					send_something_now = 1;
+				}
+			} else {
+				/* Duplicate fragment; repeat the ACK quickly. */
+				send_ping_soon = 500;
+			}
+		} else if (new_down_seqno != inrx.seq &&
+			   !recent_seqno(inrx.seq, new_down_seqno)) {
+			/* The server abandoned the old packet. */
+			reliable_rx_reset(&inrx, new_down_seqno);
+			inpkt.seqno = new_down_seqno;
+			inpkt.fragment = new_down_fragment;
+			inpkt.len = 0;
+			send_ping_soon = 500;
+		}
+	} else {
 	if (read == 2 && new_down_seqno != inpkt.seqno &&
 	    !recent_seqno(inpkt.seqno, new_down_seqno)) {
 		/* This is a seqno that we didn't see yet, but it has
@@ -857,13 +1015,43 @@ tunnel_dns(sock_t tun_fd, sock_t dns_fd)
 
 		break;
 	}
+	}
 
 	/* NOTE: buf[] was overwritten when down-packet complete */
 
 
 	/* Upstream data traffic */
 
-	if (is_sending()) {
+	if (reliable_mode && is_sending()) {
+		int progressed = 0;
+		int next;
+
+		if (have_ack_bitmap && up_ack_seqno == outtx.seq &&
+		    reliable_tx_ack(&outtx, ack_bitmap))
+			progressed = 1;
+
+		if (progressed)
+			reliable_mtu_success(&up_mtu, outpkt.sentlen);
+
+		if (reliable_tx_complete(&outtx)) {
+			outpkt.offset = 0;
+			outpkt.len = 0;
+			outpkt.sentlen = 0;
+			outchunkresent = 0;
+			if (!send_ping_soon || send_ping_soon > 20)
+				send_ping_soon = 20;
+		} else {
+			next = reliable_tx_next(&outtx);
+			if (progressed && next >= 0) {
+				outpkt.fragment = next;
+				outpkt.offset = outtx.offset[next];
+				outchunkresent = 0;
+				send_chunk(dns_fd);
+				send_ping_soon = 0;
+				send_something_now = 0;
+			}
+		}
+	} else if (is_sending()) {
 		/* already checked read>=2 */
 #if 0
 		ui_log("Got ack for %d,%d - expecting %d,%d - id=%d cur=%d prev=%d prev2=%d\n",
@@ -969,11 +1157,32 @@ client_tunnel(sock_t tun_fd, sock_t dns_fd)
 				   or ack probably dropped somewhere.
 				   But problem: no cache-miss-counter,
 				   so hostname will be identical.
-				   Just drop whole packet after 3 retries,
+				   Just drop whole packet after a few retries,
 				   and TCP retransmit will solve it.
 				   NOTE: tun dropping above should be
 				   >=(value_here - 1) */
-				if (outchunkresent < 3) {
+				if (reliable_mode && outchunkresent == 0)
+					reliable_mtu_loss(&up_mtu);
+				if (reliable_mode && outchunkresent == 1 &&
+				    dataenc != &base32_ops) {
+					ui_log("Data fragment timed out with %s; "
+					       "falling back to Base32\n",
+					       dataenc->name);
+					handshake_switch_codec(dns_fd, 5);
+					if (dataenc == &base32_ops) {
+						/* The packet was fragmented for the old
+						   codec; let TCP retransmit it. */
+						outpkt.offset = 0;
+						outpkt.len = 0;
+						outpkt.sentlen = 0;
+						outchunkresent = 0;
+						memset(&outtx, 0, sizeof(outtx));
+						send_ping(dns_fd);
+						send_ping_soon = 0;
+						continue;
+					}
+				}
+				if (outchunkresent < (reliable_mode ? 5 : 3)) {
 					outchunkresent++;
 					send_chunk(dns_fd);
 				} else {
@@ -981,6 +1190,9 @@ client_tunnel(sock_t tun_fd, sock_t dns_fd)
 					outpkt.len = 0;
 					outpkt.sentlen = 0;
 					outchunkresent = 0;
+					if (reliable_mode)
+						memset(&outtx, 0,
+						       sizeof(outtx));
 
 					send_ping(dns_fd);
 				}
@@ -1036,6 +1248,7 @@ send_fragsize_probe(sock_t fd, int fragsize)
 {
 	char probedata[256];
 	char buf[4096];
+	unsigned int prefix = 5;
 
 	/*
 	 * build a large query domain which is random and maximum size,
@@ -1046,8 +1259,11 @@ send_fragsize_probe(sock_t fd, int fragsize)
 	rand_seed++;
 
 	/* Note: must either be same, or larger, than send_chunk() */
-	build_hostname(buf + 5, sizeof(buf) - 5, probedata, sizeof(probedata),
-		       topdomain, dataenc, hostname_maxlen);
+	if (reliable_mtu_value(&up_mtu) <= prefix)
+		return;
+	build_hostname(buf + prefix, sizeof(buf) - prefix, probedata,
+		       sizeof(probedata), topdomain, dataenc,
+		       reliable_mtu_value(&up_mtu) - prefix);
 
 	fragsize &= 2047;
 
@@ -1928,6 +2144,36 @@ codec_revert:
 	selecttimeout = 1;
 }
 
+static int
+handshake_reliable(sock_t dns_fd)
+{
+	char option[] = { 'o', b32_5to8(userid), 'e', 0 };
+	char in[4096];
+	int i;
+	int read;
+
+	if ((size_t) hostname_maxlen < hostname_need(topdomain) + 16) {
+		ui_log("Hostname limit is too small for reliable mode\n");
+		return 0;
+	}
+
+	for (i = 0; running && i < 5; i++) {
+		send_handshake_query(dns_fd, option);
+		read = handshake_waitdns(dns_fd, in, sizeof(in), 'o', i + 1);
+
+		if (read >= 8 && !strncmp("Reliable", in, 8)) {
+			reliable_mode = 1;
+			reliable_rx_reset(&inrx, 0);
+			ui_log("Selective retransmission enabled\n");
+			return 1;
+		}
+		if (read > 0 && (!strncmp("BADCODEC", in, 8) ||
+				 !strncmp("BADLEN", in, 6)))
+			return 0;
+	}
+	return 0;
+}
+
 static void
 handshake_lazyoff(sock_t dns_fd)
 /* Used in the middle of data transfer, timing is different and no error msgs */
@@ -2201,6 +2447,10 @@ client_handshake(sock_t dns_fd, int raw_mode, int autodetect_frag_size, int frag
 		if (downenc) {
 			handshake_switch_downenc(dns_fd);
 		}
+		if (!running)
+			return -1;
+
+		handshake_reliable(dns_fd);
 		if (!running)
 			return -1;
 

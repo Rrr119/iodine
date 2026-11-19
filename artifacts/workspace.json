@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid28756",
+  "B": "/home/dev/feedback/uid28756",
+  "sha": "b4e41284f86fd39c0fdabc1e0cb56723d357a85b",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "yarrick",
+    "repo": "iodine",
+    "sha": "b4e41284f86fd39c0fdabc1e0cb56723d357a85b"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "iodine",
+    "cloneUrl": "https://github.com/Rrr119/iodine.git"
+  },
+  "at": "2026-11-19T23:00:55.972Z"
+}
